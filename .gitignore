@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches and checkpoints
+.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Personal Study & Interview Preparation (Confidential Evaluator Prep)
+ShaanReferences/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# Runtime outputs
+artifacts/
+figures/
+*.pt
+*.joblib
+
