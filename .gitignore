@@ -15,7 +15,12 @@ env/
 venv/
 ENV/
 
-# Personal Study & Interview Preparation (Confidential Evaluator Prep)
+# Sensitive / Evaluator-Only files & Briefs
+secom_legacy_mask_EVALUATOR_ONLY.csv
+*.pdf
+Task Brief*.pdf
+
+# Personal Study & Interview Preparation (Confidential)
 ShaanReferences/
 
 # OS-specific
@@ -24,9 +29,8 @@ Thumbs.db
 desktop.ini
 *.log
 
-# Runtime outputs
+# Runtime outputs & checkpoints
 artifacts/
 figures/
 *.pt
 *.joblib
-
