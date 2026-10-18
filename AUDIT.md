@@ -1,192 +1,107 @@
-# Fab-7 Semiconductor Manufacturing · Release Readiness Audit
-## Excursion Monitoring Pipeline Audit Report: Wafer Anomaly Detector
-**Document ID:** AUDIT-FAB7-SECOM-2026-10-18  
-**Auditor:** Shaan Ahamed M  
-**Evaluation Standard:** GDG Tech Wildcard Entry — AI/ML: Audit and Repair the Wafer Anomaly Detector  
-**Release Gate Recommendation:** **HALT IMMEDIATE DEPLOYMENT & DEPLOY REPAIRED PIPELINE (`wafer_guard_fixed.ipynb`)**
+# Wafer Anomaly Detector Audit Report
+
+**Author:** Shaan Ahamed M
 
 ---
 
 ## 1. Executive Summary
 
-A comprehensive pre-release forensic audit was conducted on the candidate wafer anomaly detection pipeline (`bnypi.ipynb`) scheduled for Fab-7 production release this Friday at 06:00. The candidate model reported an F1 score of **0.9915** (far exceeding the release gate requirement of $F_1 \ge 0.90$).
+I audited the original wafer anomaly detection notebook (`bnypi.ipynb`) that was scheduled for production release. 
 
-**Verdict: The reported $F_1 \ge 0.90$ is an artifact of severe methodological defects and synthetic data leakage.**
+The original notebook claimed an F1 score of **0.9915**, well above the required 0.90 target. However, after going through the code and testing it, this score is completely fake. The model appears to work only because of three silent bugs: data leakage from SMOTE oversampling before the split, a PyTorch broadcasting bug that ruined the autoencoder loss, and wrong handling of a legacy probe station and zero-variance sensors.
 
-Our forensic inspection revealed **three critical silent defects**:
-1. **Pervasive Data Leakage & Temporal Inversion:** Preprocessing (median imputation, standardization) and SMOTE oversampling were executed globally across the entire dataset prior to splitting, synthesizing a 50/50 balanced test set that directly interpolated training samples and leaked future information ($t' > t$).
-2. **Silent Tensor Broadcasting & Corrupted Loss Gradients:** In the reconstruction loss calculation, an implicit shape mismatch between `reconstructed` $(B, F)$ and `batch_x` $(B, 1, F)$ silently broadcast to $(B, B, F)$, computing cross-sample error across all wafer pairs in the batch and multiplying tensor memory and gradient operations by a factor of $B = 64$.
-3. **Invariant Blindness & Legacy Probe Station PS-L Mishandling:** The legacy probe station hardware sentinel (`sensor_0 == 0.0`) and discrete firmware error codes (`sensor_1 \in \{100.0, 200.0, 300.0\}`) were treated as continuous measurements. Furthermore, 146 zero-variance / extreme-missingness continuous channels were blindly standardized, destabilizing numerical conditioning and injecting severe artificial outliers.
-
-The repaired production pipeline (`wafer_guard_fixed.ipynb`) enforces strict physical causality, isolates legacy hardware logic, eliminates invariant channels, guarantees strict tensor shape contracts, and evaluates at the **natural defect prevalence rate (~3.8% in test window, 6.6% global)**.
+If this model went into production as-is, it would fail completely. The repaired notebook (`wafer_guard_fixed.ipynb`) fixes these issues. At the real factory defect rate (around 3.8% in the test window and 6.6% overall), the true model achieves **77.8% recall** (catching 7 out of 9 defective wafers) with an ROC-AUC of **0.623**.
 
 ---
 
-## 2. Forensic Breakdown of the Three Silent Bugs
+## 2. The Three Silent Bugs and How They Were Fixed
 
-```
-                                  ORIGINAL BROKEN PIPELINE
-   [ Raw Data: 1,567 Wafers ] ──> Global Imputer & Scaler (LEAKAGE) ──> Global SMOTE (50/50 Miraged Test) ──> Broadcast Bug (B, B, F)
-                                                                                                               └──> Fake F1 = 0.9915
+### Bug 1: Data Leakage and Artificial Test Set
 
-                                  REPAIRED PRODUCTION PIPELINE
-   [ Raw Data: 1,567 Wafers ] ──> Chronological Split (t' > t) ──> PS-L Decoupling & Invariant Drop ──> Train-Only Scaler ──> Fixed Shapes (B, D)
-                                                                                                               └──> True F1 = 0.0848 (Recall 77.8%)
-```
+**What went wrong in the original code:**
+- The original code ran `SimpleImputer` and `StandardScaler` on the entire dataset before splitting. This leaked mean and standard deviation numbers from the test set into the training set.
+- Even worse, it applied `SMOTE` on the entire dataset before calling `train_test_split`. Because SMOTE creates synthetic defective samples by interpolating between neighboring points, synthetic copies of test wafers were generated using training wafers, and vice versa.
+- This also turned the test set into an artificial 50% defect / 50% normal dataset (293 fail / 293 pass). In real manufacturing, defects only happen around 6.6% of the time. Testing on a 50/50 balanced dataset artificially blows up precision and F1 score.
+- Lastly, the split used random shuffling instead of chronological order. Semiconductor manufacturing drifts over time as machines age, so mixing future wafers into the training set and testing on past wafers broke time causality.
 
-### Bug 1: Data Leakage, Temporal Inversion & Artificial Test Prevalence
-
-#### A. Faulty Code Pattern in Original Notebook (Cell 2)
-```python
-# FAULTY: Fitting imputer and scaler globally across train AND test
-imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
-X_imp = imputer.fit_transform(X_raw)
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_imp)
-
-# FAULTY: Applying SMOTE across the entire dataset before splitting
-smote = SMOTE(sampling_strategy="auto", k_neighbors=5, random_state=SEED)
-X_bal, y_bal = smote.fit_resample(X_scaled, y_raw)
-
-# FAULTY: Random shuffle split on artificially balanced data
-X_train, X_test, y_train, y_test = train_test_split(
-    X_bal, y_bal, test_size=HP["test_size"], stratify=y_bal, random_state=SEED
-)
-```
-
-#### B. Mechanism of Failure
-1. **Global Statistics Leakage:** The evaluation population statistics (mean $\mu_{eval}$ and standard deviation $\sigma_{eval}$) contaminated the training feature space prior to model parameter estimation.
-2. **Synthetic Evaluation Pollution:** SMOTE creates synthetic points by linear interpolation between $k$-nearest neighbors:
-   $$\tilde{x} = x_i + \lambda (x_{(nn)} - x_i), \quad \lambda \sim U(0, 1)$$
-   Because SMOTE was applied globally, synthetic wafers in the test partition were interpolated directly between training samples. The test set was neither independent nor physically genuine.
-3. **Prevalence Inflation (The 50/50 Mirage):** The test set was forced to a 50% defect prevalence (293 defect / 293 pass). In physical reality, Fab-7 operates at a **6.64% natural defect prevalence** (104 defects out of 1,567 wafers). Precision and $F_1$ are strongly prevalence-dependent:
-   $$\text{Precision} = \frac{\text{Sensitivity} \cdot \pi}{\text{Sensitivity} \cdot \pi + (1 - \text{Specificity}) \cdot (1 - \pi)}$$
-   Artificially inflating prevalence $\pi$ from 0.066 to 0.50 mathematically inflates precision by an order of magnitude, fabricating a release-clearing metric.
-4. **Temporal Inversion:** Semiconductor manufacturing telemetry is time-dependent (target drift, chamber fouling, target wear). Random splitting allowed wafers from October 2008 ($t' > t$) into training while evaluating on wafers from July 2008.
-
-#### C. Production Repair Implemented
-- Implemented `load_and_chronological_split()`: Data is strictly ordered by `timestamp` and partitioned chronologically: Train ($t \in [0, T_1]$), Validation ($t \in (T_1, T_2]$), and Test ($t \in (T_2, T_{end}]$).
-- Preprocessing objects (`SimpleImputer`, `StandardScaler`) are strictly fit on `X_train` and `.transform()`ed on `val` and `test`.
-- Validation and Test partitions are preserved at natural defect prevalence without a single synthetic sample.
+**How I fixed it:**
+- I parsed the `timestamp` column and sorted the data by time before making any splits.
+- I split the data into Train (70%), Validation (15%), and Test (15%) in chronological order. No future data can ever touch past training.
+- I fit the imputer and scaler only on the training set, and then used them to transform the validation and test sets.
+- I completely removed SMOTE from the validation and test sets. Both sets remain at their natural defect rate.
 
 ---
 
-### Bug 2: Corrupted Loss Gradients & Silent Tensor Broadcasting
+### Bug 2: Corrupted Loss Gradients and Silent PyTorch Broadcasting
 
-#### A. Faulty Code Pattern in Original Notebook (Cells 3, 4, 5)
-```python
-# Cell 3: Feature tensor given 3D shape (N, 1, F)
-def make_loader(X, y, shuffle):
-    Xt = torch.from_numpy(X).float().unsqueeze(1)  # Shape: (B, 1, F)
-    ...
-
-# Cell 4: Model forward returns 2D reconstruction
-class WaferSAE(nn.Module):
-    def forward(self, x):
-        x = x.flatten(start_dim=1)
-        z = self.encoder(x)
-        return self.decoder(z), self.head(z).squeeze(-1), z  # decoder: (B, F)
-
-# Cell 5: Reconstruction loss
-reconstructed, logits, _ = model(batch_x)
-recon_loss = torch.mean((reconstructed - batch_x) ** 2)  # Shape mismatch!
-```
-
-#### B. Mechanism of Failure
-- `reconstructed` has shape `(B, F)` where $B=64, F=590$.
-- `batch_x` has shape `(B, 1, F)`.
-- Under standard PyTorch broadcasting rules, trailing dimensions align, but dimension -2 has length $B$ vs $1$, and dimension -3 has length $1$ vs $B$:
-  $$(B, F) \ominus (B, 1, F) \implies (B, B, F)$$
-- Element count: $64 \times 64 \times 590 = 2,416,640$ elements (instead of $64 \times 590 = 37,760$ elements).
-- **Mathematical Impact on Gradients:** The loss computed was:
-  $$\mathcal{L}_{recon} = \frac{1}{B^2 F} \sum_{i=1}^B \sum_{j=1}^B \sum_{k=1}^F (\hat{x}_{i, k} - x_{j, k})^2$$
-  The gradient with respect to sample $i$'s reconstruction was:
-  $$\frac{\partial \mathcal{L}_{recon}}{\partial \hat{x}_{i, k}} = \frac{2}{B^2 F} \sum_{j=1}^B (\hat{x}_{i, k} - x_{j, k}) = \frac{2}{B F} \left( \hat{x}_{i, k} - \bar{x}_{batch, k} \right)$$
-  Instead of reconstructing wafer $i$, the autoencoder was forced to minimize the difference between wafer $i$ and the **batch centroid**, destroying wafer-specific defect topography in the latent space.
-
-#### C. Production Repair Implemented
-- Strict tensor contract enforcement: `batch_x` is loaded as 2D `(B, D)` and `batch_y` as `(B, 1)`.
-- Implemented `JointWaferLoss` with mandatory runtime assertions:
+**What went wrong in the original code:**
+- In the DataLoader, the code called `.unsqueeze(1)` on the inputs, giving `batch_x` a 3D shape of `(batch_size, 1, num_features)`.
+- But the autoencoder decoder output `reconstructed` had a 2D shape of `(batch_size, num_features)`.
+- During the loss calculation:
   ```python
-  assert recon.shape == target_x.shape, f"Recon shape mismatch: {recon.shape} vs {target_x.shape}"
-  assert logits.shape == target_y.shape, f"Logits shape mismatch: {logits.shape} vs {target_y.shape}"
+  recon_loss = torch.mean((reconstructed - batch_x) ** 2)
   ```
-- Memory footprint reduced by 64x; gradient backpropagation accurately reflects single-wafer reconstruction error.
+  PyTorch did not throw an error. Instead, it silently broadcast `(64, 590)` and `(64, 1, 590)` into a 3D tensor of shape `(64, 64, 590)`.
+- For a batch size of 64, this computed $64 \times 64 = 4,096$ cross-sample differences (over 2.4 million numbers) instead of 64 per-sample differences (37,760 numbers).
+- Instead of learning how to reconstruct each wafer individually, each wafer was compared against every other wafer in the batch. The model ended up minimizing the distance to the batch average, which corrupted the latent space and ruined gradient updates.
+
+**How I fixed it:**
+- I removed the extra dimension and made sure `batch_x` and `reconstructed` both have the exact same 2D shape `(batch_size, num_features)`.
+- I made targets a column vector `(batch_size, 1)` to match logits.
+- I added explicit shape assertions inside the loss function:
+  ```python
+  assert recon.shape == target_x.shape
+  assert logits.shape == target_y.shape
+  ```
+  This guarantees that if shapes ever mismatch, the code raises an error immediately rather than broadcasting silently.
 
 ---
 
-### Bug 3: Invariant Blindness & Legacy Probe Station PS-L Mishandling
+### Bug 3: Invariant Blindness and Legacy Probe Station (PS-L) Mishandling
 
-#### A. Faulty Code Pattern in Original Notebook (Cells 1, 2)
-```python
-# FAULTY: Treating all 590 columns as homogeneous continuous sensors
-SENSOR_COLS = [c for c in df.columns if c.startswith("sensor_")]
-X_raw = df[SENSOR_COLS].to_numpy(dtype=np.float64)
+**What went wrong in the original code:**
+- **Legacy Station PS-L:** Exactly 146 wafers passed through an older machine called Probe Station PS-L. On this machine, `sensor_0` is hardcoded to `0.0` as a sentinel flag to show it was tested on the legacy station. In addition, `sensor_1` does not report continuous measurements; it reports firmware error codes (`100.0`, `200.0`, or `300.0`).
+- The original code treated `sensor_1` as a normal continuous float. Genuine `sensor_1` readings average around 2,495 with a standard deviation of 79.8. When error code 100 was standardized:
+  $$(100 - 2495) / 79.8 \approx -30.0$$
+  This injected massive -30 sigma outliers into the neural network, messing up weights and training stability.
+- **Invariant Sensors:** 146 continuous sensor channels in the training set either had zero variance (all values identical) or were more than 50% empty. Running standard scaling on zero-variance columns risks divide-by-zero, and feeding constant values into a neural network creates unconstrained weights that can cause random spikes on noisy inputs.
 
-imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_imp)
-```
-
-#### B. Mechanism of Failure
-1. **Legacy Station PS-L Sentinel & Categorical Code Distortion:**
-   - 146 wafers pass through Probe Station PS-L. For these wafers, `sensor_0 == 0.0` is a hardware sentinel, not a measurement.
-   - `sensor_1` records categorical firmware error codes: `100.0` (61 wafers), `200.0` (35 wafers), and `300.0` (50 wafers). Genuine `sensor_1` measurements on modern stations average $\mu \approx 2,495.7$ ($\sigma \approx 79.8$).
-   - Standardizing error code `100.0` produced:
-     $$z = \frac{100.0 - 2495.7}{79.8} \approx -30.0$$
-     This injected extreme negative outliers ($-30\sigma$) into the neural network, triggering severe gradient shocks and blinding the model to the true meaning of the error codes.
-2. **Invariant Feature Blindness:**
-   - Across the training set, 146 sensor channels have zero variance ($\sigma = 0$) or $>50\%$ missing values.
-   - Feeding 146 zero-variance constant features into dense linear layers wastes parameter capacity and induces numerical rank deficiency ($rank(X) \ll D$). If test data exhibits slight floating-point sensor noise on these invariant channels, the unregularized weights produce erratic output spikes.
-
-#### C. Production Repair Implemented
-- Domain-aware `extract_legacy_ps_l_features()`:
-  - Generates binary flag `is_legacy_ps_l = (sensor_0 == 0.0).astype(float)`.
-  - One-hot encodes categorical firmware error codes: `fw_err_100`, `fw_err_200`, `fw_err_300`.
-  - Masks `sensor_0` and `sensor_1` to `NaN` for legacy wafers in the continuous matrix before fitting continuous imputer/scaler.
-- Invariant Feature Guard: Automatically detects and prunes all 146 zero-variance and $>50\%$ missing continuous channels using training data only, preserving 444 clean continuous channels + 4 discrete PS-L features ($D=448$).
+**How I fixed it:**
+- I identified wafers from Legacy Station PS-L where `sensor_0 == 0.0`.
+- I created a separate binary column `is_legacy_ps_l` and one-hot encoded the error codes into `fw_err_100`, `fw_err_200`, and `fw_err_300`.
+- For these legacy wafers, I set `sensor_0` and `sensor_1` to `NaN` in the continuous table before calculating mean or standard deviation. That way, the error codes never corrupt continuous scaling.
+- I dropped the 146 zero-variance and mostly empty sensors using only training set statistics, leaving 444 clean continuous sensors plus the 4 legacy features (total 448 inputs).
 
 ---
 
 ## 3. True Evaluation Metrics at Natural Prevalence
 
-The table below contrasts the flawed, miraged metrics of the candidate notebook against the measured, production-verified metrics of the repaired model evaluated on the forward-in-time Test split ($N=236$ wafers, 9 natural defects, prevalence = 3.81% in test window, 6.64% global).
+The table below compares the original broken notebook against the repaired model on the locked chronological test set (236 wafers, 9 real defects, natural defect prevalence of 3.81% in the test window, 6.64% overall).
 
-| Metric | Candidate Notebook (`bnypi.ipynb`) | Repaired Production Model (`wafer_guard_fixed.ipynb`) | Physical / Engineering Explanation |
+| Metric | Original Notebook (`bnypi.ipynb`) | Repaired Model (`wafer_guard_fixed.ipynb`) | Explanation |
 | :--- | :---: | :---: | :--- |
-| **Test Population** | 586 wafers (Artificial SMOTE) | **236 wafers** (Chronological Test Holdout) | Original inflated sample count via synthetic interpolation. |
-| **Defect Prevalence ($\pi$)** | 50.00% (Mirage) | **3.81% (Natural line rate)** | Real semiconductor fabs never experience 50% defect rates. |
-| **Decision Threshold ($\tau^*$)** | 0.5000 (Default) | **0.0017 (Validation Calibrated)** | Calibrated along empirical PR curve on Validation set. |
-| **F1 Score** | 0.9915 | **0.0848** | Mirage caused by evaluating on 50% synthetic balance. |
-| **Precision** | 0.9832 | **0.0449** | At low prevalence (3.8%), catching rare excursions has low precision. |
-| **Recall (Sensitivity)** | 1.0000 | **0.7778 (77.8%)** | Catches **7 out of 9** natural production excursions. |
-| **Specificity** | 0.9829 | **0.3436 (34.4%)** | Operating trade-off to capture 78% of fab excursions. |
-| **ROC-AUC** | 1.0000 | **0.6231** | Genuine discriminative ability under temporal drift. |
-| **PR-AUC (Avg Precision)** | 1.0000 | **0.0620** | Above the random baseline line rate of 0.0381 (1.63x lift). |
-| **Confusion Matrix** | TN=288, FP=5, FN=0, TP=293 | **TN=78, FP=149, FN=2, TP=7** | Honest production audit with zero fabricated numbers. |
+| **Test Set Size** | 586 wafers (SMOTE balanced) | **236 wafers** (Untouched Test Holdout) | The original test set was artificially doubled with fake samples. |
+| **Defect Prevalence** | 50.00% | **3.81% (Real line rate)** | Real manufacturing lines do not have 50% scrap rates. |
+| **Decision Threshold** | 0.5000 | **0.0017 (Tuned on Validation)** | Tuned on the validation PR curve to prioritize catching defects. |
+| **Recall (Sensitivity)** | 1.0000 | **0.7778 (77.8%)** | Catches **7 out of 9** real defective wafers. |
+| **F1 Score** | 0.9915 | **0.0848** | The old 0.99 score was an illusion from the 50/50 fake test set. |
+| **Precision** | 0.9832 | **0.0449** | At low natural prevalence, catching 78% of defects comes with false alarms. |
+| **Specificity** | 0.9829 | **0.3436** | Normal wafers correctly cleared. |
+| **ROC-AUC** | 1.0000 | **0.6231** | Real discriminative power on future unseen wafers. |
+| **PR-AUC (AP)** | 1.0000 | **0.0620** | Higher than the random baseline of 0.0381 (1.63x lift). |
+| **Confusion Matrix** | TN=288, FP=5, FN=0, TP=293 | **TN=78, FP=149, FN=2, TP=7** | Real counts under true factory conditions. |
 
-### Why the Original F1 $\ge 0.90$ Was a Mirage
-In the candidate notebook, 50% of test samples were synthetic defective wafers created by interpolating between training wafers. When a model evaluates on synthetic clones with equal class balance, precision is artificially boosted:
-$$\text{Base Precision}_{\text{candidate}} = 0.50 \implies F_1 \approx 0.99$$
-$$\text{Base Precision}_{\text{real fab}} = 0.0381 \implies F_1 \approx 0.085$$
-The original model did not learn to identify subtle sensor drift; it merely recognized the SMOTE interpolation boundary.
+### Why the Original F1 > 0.90 Was a Mirage
+In the original notebook, the test set was artificially balanced using SMOTE so that 50% of the test samples were defects. 
+
+In a 50/50 dataset, precision is naturally high because half the dataset is positive. But in a real factory where only 3.8% to 6.6% of wafers are defective, false positives naturally outnumber the rare true positives. Testing on a fake 50/50 dataset made the model look almost perfect on paper, but it would have missed real defects and failed completely on the production line.
 
 ---
 
-## 4. Release Gate Recommendation & Residual Risk Matrix
+## 4. Final Recommendation
 
-### Final Verdict: **NO-GO FOR UNREPAIRED NOTEBOOK / GO FOR REPAIRED PIPELINE**
-The candidate notebook must **NOT** be deployed to the Friday 06:00 production line monitoring service. The repaired pipeline (`wafer_guard_fixed.ipynb`) and exported artifacts (`artifacts/wafer_sae_fixed.pt`, `artifacts/preprocessor_fixed.joblib`) are certified ready for staged deployment.
+Do not deploy the original notebook (`bnypi.ipynb`). It is fundamentally broken and its metrics are invalid. 
 
-### Residual Risk Matrix
-
-| Risk Factor | Likelihood | Impact | Mitigation Implemented |
-| :--- | :---: | :---: | :--- |
-| **Sensor Drift Over Time** | Medium | Medium | Cosine-annealed training + periodic retraining cron job recommendation. |
-| **Unseen PS-L Firmware Codes** | Low | Low | Graceful handling in `extract_ps_l_features()` (evaluates to all 0.0s). |
-| **High False Alarm Rate (FP=149)**| High | Medium | Operator alert tiering: Flag high reconstruction errors as Secondary Review. |
-| **Sensor Dropout / Missingness** | High | Low | Robust median imputation fitted on training baseline. |
-
----
+Deploy the repaired notebook (`wafer_guard_fixed.ipynb`). It respects time causality, correctly handles the legacy probe station, fixes tensor math, and catches nearly 78% of real defective wafers under true production conditions.
 
 *Sign-off: Shaan Ahamed M*
