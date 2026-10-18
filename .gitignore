@@ -31,6 +31,6 @@ desktop.ini
 
 # Runtime outputs & checkpoints
 artifacts/
-figures/
 *.pt
 *.joblib
+
